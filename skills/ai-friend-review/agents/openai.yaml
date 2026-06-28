@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Friend Review"
+  short_description: "Run multi-AI code reviews with local coding agents."
+  default_prompt: "Use $ai-friend-review to discover local AI coding agents and run a read-only review of my current changes."
