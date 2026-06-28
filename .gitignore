@@ -1,0 +1,12 @@
+# Owner-only, never published
+.internal/
+
+# Local review output written by the skill
+.ai-friend-review/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
