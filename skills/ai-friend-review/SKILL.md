@@ -46,32 +46,47 @@ Prefer AI agents other than the current one. Pass `--current-agent <name>` when 
 
 Use at least two external reviewers when available. Include the current agent only when the user asks, by passing `--include-self` or `--include-current-agent`, or when fewer than two other reviewers are available.
 
+If an auto-ranked reviewer cannot handle the selected target, the runner skips it with a notice and continues with runnable reviewers. If the user explicitly requested that reviewer through `--reviewer` or `--reviewers`, the runner exits instead so the mismatch is visible.
+
 Supported local CLIs are discovered from PATH:
 
 - `agy` (Antigravity CLI)
 - `codex`
+- `devin`
 - `claude`
 - `opencode`
-- `cursor` (detected, but not used for headless review unless a later script version supports it)
+- `cursor` (Cursor Agent)
+- `greptile` (native branch/diff review)
+- `kiro`
+- `ollama` local model reviewers: `gemma3`, `qwen3`, and `llama3`
 
-Default reviewer ranking is `agy, claude, opencode, codex`. Override it without editing the skill by setting `AI_FRIEND_REVIEWER_RANKING`, for example:
+Default reviewer ranking is `agy, claude, devin, opencode, codex, cursor, greptile, kiro, gemma3, qwen3, llama3`. Override it without editing the skill by setting `AI_FRIEND_REVIEWER_RANKING`, for example:
 
 ```bash
-AI_FRIEND_REVIEWER_RANKING=opencode,agy,claude python3 <skill-dir>/scripts/run_review.py --count 2
+AI_FRIEND_REVIEWER_RANKING=opencode,cursor,agy python3 <skill-dir>/scripts/run_review.py --count 2
 ```
+
+Ollama model reviewers are discovered when `ollama` is on PATH and a matching local model is installed. Discovery prefers the exact default tags `gemma3:1b`, `qwen3:0.6b`, and `llama3:8b-instruct-q2_K`, then falls back to another installed tag with the same base model name. Override model names with `AI_FRIEND_OLLAMA_GEMMA3_MODEL`, `AI_FRIEND_OLLAMA_QWEN3_MODEL`, and `AI_FRIEND_OLLAMA_LLAMA3_MODEL`.
 
 The discovery cache lives at `${XDG_CACHE_HOME:-~/.cache}/ai-friend-review/agents.json`. It stores executable paths, versions, and safe invocation templates only. Never inspect auth files, tokens, shell history, private chat logs, or model transcripts.
 
 ## Review Standard
 
-All reviewers receive the same standardized review goal and rubric. The runner only adapts how each CLI is invoked:
+Prompt-based reviewers receive the same standardized review goal and rubric. The runner only adapts how each CLI is invoked:
 
 - `agy`: `agy --print <short prompt-file instruction> --sandbox`
 - `codex`: `codex exec --sandbox read-only <short prompt-file instruction>`.
+- `devin`: `devin -p --permission-mode auto --sandbox --prompt-file <prompt-file>`
 - `claude`: `claude -p --permission-mode plan <short prompt-file instruction>`
 - `opencode`: `opencode run --agent plan --dir <repo> <short prompt-file instruction>`
+- `cursor`: `cursor agent --print --mode plan --sandbox enabled --trust --workspace <repo> <short prompt-file instruction>`
+- `kiro`: `kiro-cli-chat chat --no-interactive --trust-tools=fs_read --wrap never <short prompt-file instruction>`
+- `greptile`: `greptile review --agent --no-color --branch <base>` for base branch targets. This is a native diff review adapter and does not read the shared prompt file. Use it with `--base` after committing branch changes; it is not used for `--uncommitted`, `--path`, or `--commit`.
+- `gemma3`, `qwen3`, `llama3`: `ollama run <model> --nowordwrap` with the full standardized prompt sent over stdin.
 
 The full standardized prompt is written to `.ai-friend-review/prompts/` before reviewer execution. This keeps large diffs out of command-line arguments and avoids exposing the full prompt through process listings.
+
+For Ollama reviewers, the prompt is sent over stdin instead of through a prompt file. For Greptile, the CLI performs its own native diff review. Keep those differences visible in reports.
 
 Keep reviewer behavior aligned around the same review standard. Do not tailor different goals per model.
 

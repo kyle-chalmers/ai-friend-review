@@ -17,7 +17,7 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 DISCOVER_SCRIPT = SCRIPT_DIR / "discover_agents.py"
 SEVERITY_RE = re.compile(r"\bP[0-3]\b")
-DEFAULT_REVIEWER_RANKING = ["agy", "claude", "opencode", "codex"]
+DEFAULT_REVIEWER_RANKING = ["agy", "claude", "devin", "opencode", "codex", "cursor", "greptile", "kiro", "gemma3", "qwen3", "llama3"]
 MAX_PROMPT_CONTEXT_CHARS = 60000
 MAX_UNTRACKED_FILE_CHARS = 12000
 DISCOVERY_TIMEOUT_SECONDS = 30
@@ -40,6 +40,7 @@ KNOWN_FINDING_LABELS = {
 class ReviewCommand:
     name: str
     command: list[str]
+    stdin: str | None = None
 
 
 @dataclass
@@ -126,7 +127,11 @@ def discover_agents(refresh: bool) -> list[dict[str, Any]]:
         stderr = result.stderr.strip()
         detail = f"\nstderr:\n{stderr}" if stderr else ""
         raise SystemExit(f"Agent discovery did not return valid JSON.{detail}") from exc
-    return [agent for agent in data.get("agents", []) if agent.get("headless_review") and not agent.get("missing_from_path")]
+    return [
+        agent
+        for agent in data.get("agents", [])
+        if agent.get("headless_review") and not agent.get("missing_from_path") and not agent.get("missing_model")
+    ]
 
 
 def reviewer_ranking() -> list[str]:
@@ -359,18 +364,94 @@ def build_command(agent: dict[str, Any], args: argparse.Namespace, root: Path) -
         command = [executable, "exec", "--sandbox", "read-only", prompt_file_instruction]
         return ReviewCommand(name=name, command=command)
 
+    if name == "devin":
+        return ReviewCommand(
+            name=name,
+            command=[executable, "-p", "--permission-mode", "auto", "--sandbox", "--prompt-file", str(prompt_file)],
+        )
+
     if name == "claude":
         return ReviewCommand(name=name, command=[executable, "-p", "--permission-mode", "plan", prompt_file_instruction])
 
     if name == "opencode":
         return ReviewCommand(name=name, command=[executable, "run", "--agent", "plan", "--dir", str(root), prompt_file_instruction])
 
+    if name == "cursor":
+        return ReviewCommand(
+            name=name,
+            command=[
+                executable,
+                "agent",
+                "--print",
+                "--mode",
+                "plan",
+                "--sandbox",
+                "enabled",
+                "--trust",
+                "--workspace",
+                str(root),
+                prompt_file_instruction,
+            ],
+        )
+
+    if name == "greptile":
+        if args.commit or args.path or not args.base:
+            return None
+        command = [executable, "review", "--agent", "--no-color", "--branch", args.base]
+        return ReviewCommand(name=name, command=command)
+
+    if name == "kiro":
+        return ReviewCommand(
+            name=name,
+            command=[
+                executable,
+                "chat",
+                "--no-interactive",
+                "--trust-tools=fs_read",
+                "--wrap",
+                "never",
+                prompt_file_instruction,
+            ],
+        )
+
+    if name in {"gemma3", "qwen3", "llama3"}:
+        model = agent.get("model")
+        if not model:
+            return None
+        command = [executable, "run", str(model), "--nowordwrap"]
+        if name == "qwen3" and agent.get("supports_thinking_flags"):
+            command.extend(["--think=false", "--hidethinking"])
+        prompt = getattr(args, "review_prompt", None) or review_prompt(args, root)
+        return ReviewCommand(name=name, command=command, stdin=prompt)
+
     return None
+
+
+def skip_reason(name: str) -> str:
+    if name == "greptile":
+        return "supports --base only"
+    return "adapter is not available for this target"
+
+
+def skipped_summary(names: list[str]) -> str:
+    return ", ".join(f"{name} ({skip_reason(name)})" for name in names)
 
 
 def run_reviewer(review_command: ReviewCommand, root: Path, timeout: int) -> tuple[int, str]:
     try:
-        result = run_capture(review_command.command, root, timeout)
+        if review_command.stdin is None:
+            result = run_capture(review_command.command, root, timeout)
+        else:
+            result = subprocess.run(
+                review_command.command,
+                cwd=str(root),
+                check=False,
+                input=review_command.stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
         if isinstance(output, bytes):
@@ -612,7 +693,8 @@ def write_report(
         "",
     ]
     for item in commands:
-        lines.append(f"- `{item.name}`: `{command_display(item.command)}`")
+        stdin_note = " (review prompt sent over stdin)" if item.stdin is not None else ""
+        lines.append(f"- `{item.name}`: `{command_display(item.command)}`{stdin_note}")
 
     clusters = cluster_findings(outputs)
     lines.extend(
@@ -715,6 +797,7 @@ def main() -> int:
     requested = args.reviewer[:]
     if args.reviewers:
         requested.extend(name.strip() for name in args.reviewers.split(",") if name.strip())
+    explicit_requested = set(unique_names([name.lower() for name in requested]))
     include_current = args.include_current_agent or args.include_self
     selected = select_reviewers(agents, requested, args.current_agent, include_current, args.count)
     if not selected:
@@ -726,16 +809,36 @@ def main() -> int:
         prompt_file = unique_artifact_path(root, "prompts", target_name(args), ".txt")
         prompt_file.write_text(prompt)
     args.prompt_file = prompt_file
-    commands = [command for agent in selected if (command := build_command(agent, args, root))]
+    args.review_prompt = prompt
+    commands: list[ReviewCommand] = []
+    skipped_explicit: list[str] = []
+    skipped_auto: list[str] = []
+    for agent in selected:
+        command = build_command(agent, args, root)
+        if command is None:
+            if agent["name"] in explicit_requested:
+                skipped_explicit.append(agent["name"])
+            else:
+                skipped_auto.append(agent["name"])
+        else:
+            commands.append(command)
+    if skipped_explicit:
+        raise SystemExit(
+            "Reviewer(s) cannot run for this target: "
+            f"{skipped_summary(skipped_explicit)}."
+        )
     if not commands:
         raise SystemExit("No runnable reviewer commands were built.")
 
-    print("AI Friend Review will run read-only reviewer commands.")
-    print("These commands may consume paid or quota-limited AI usage.")
-    print("Review context may include diffs and untracked file contents. Inspect your changes for secrets before running external reviewers.")
-    print(f"Full review prompt file: {prompt_file}")
+    print("AI Friend Review will run read-only reviewer commands.", flush=True)
+    print("These commands may consume paid or quota-limited AI usage.", flush=True)
+    print("Review context may include diffs and untracked file contents. Inspect your changes for secrets before running external reviewers.", flush=True)
+    print(f"Full review prompt file: {prompt_file}", flush=True)
     for item in commands:
-        print(f"- {item.name}: {command_display(item.command)}")
+        stdin_note = " (review prompt sent over stdin)" if item.stdin is not None else ""
+        print(f"- {item.name}: {command_display(item.command)}{stdin_note}", flush=True)
+    if skipped_auto:
+        print(f"Skipped reviewer(s): {skipped_summary(skipped_auto)}.", flush=True)
 
     if args.dry_run:
         return 0
@@ -743,6 +846,7 @@ def main() -> int:
     outputs: dict[str, str] = {}
     exit_codes: dict[str, int] = {}
     for item in commands:
+        print(f"Running reviewer: {item.name}", flush=True)
         code, output = run_reviewer(item, root, args.timeout)
         exit_codes[item.name] = code
         outputs[item.name] = output
@@ -750,14 +854,14 @@ def main() -> int:
     path = report_path(root, target_name(args))
     write_report(path, root, args, commands, outputs, exit_codes)
 
-    print(f"Report written: {path}")
+    print(f"Report written: {path}", flush=True)
     high_signal = extract_high_signal(outputs)
     if high_signal:
-        print("High-signal finding lines:")
+        print("High-signal finding lines:", flush=True)
         for line in high_signal:
-            print(f"- {line}")
+            print(f"- {line}", flush=True)
     else:
-        print("No severity-tagged finding lines were detected. Read the report for full reviewer output.")
+        print("No severity-tagged finding lines were detected. Read the report for full reviewer output.", flush=True)
 
     return 0 if all(code == 0 for code in exit_codes.values()) else 2
 
