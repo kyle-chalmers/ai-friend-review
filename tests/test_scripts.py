@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import argparse
 import os
 import re
 import stat
@@ -24,6 +25,12 @@ assert spec and spec.loader
 run_review = importlib.util.module_from_spec(spec)
 sys.modules["run_review"] = run_review
 spec.loader.exec_module(run_review)
+
+discover_spec = importlib.util.spec_from_file_location("discover_agents", DISCOVER)
+assert discover_spec and discover_spec.loader
+discover_agents = importlib.util.module_from_spec(discover_spec)
+sys.modules["discover_agents"] = discover_agents
+discover_spec.loader.exec_module(discover_agents)
 
 
 def write_fake_cli(directory: Path, name: str, body: str | None = None) -> None:
@@ -48,8 +55,34 @@ class ScriptChecks(unittest.TestCase):
         self.bin = self.root / "bin"
         self.cache = self.root / "cache"
         self.bin.mkdir()
-        for name in ["agy", "codex", "claude", "opencode", "cursor", "gemini"]:
+        for name in ["agy", "codex", "devin", "claude", "opencode", "cursor", "greptile", "kiro-cli-chat", "gemini"]:
             write_fake_cli(self.bin, name)
+        write_fake_cli(
+            self.bin,
+            "ollama",
+            """if [ "${1:-}" = "list" ]; then
+  cat <<'MODELS'
+NAME                       ID              SIZE      MODIFIED
+gemma3:1b                  fake            815 MB    now
+qwen3:0.6b                 fake            522 MB    now
+llama3:8b-instruct-q2_K    fake            3.2 GB    now
+MODELS
+  exit 0
+fi
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "--help" ]; then
+  echo "Usage: ollama run MODEL [PROMPT] [flags]"
+  echo "      --think"
+  echo "      --hidethinking"
+  exit 0
+fi
+if [ "${1:-}" = "run" ]; then
+  cat >/dev/null
+  echo "ollama $2 fake reviewer"
+  exit 0
+fi
+echo "ollama fake reviewer"
+""",
+        )
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env['PATH']}"
         self.env["XDG_CACHE_HOME"] = str(self.cache)
@@ -80,7 +113,22 @@ class ScriptChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         data = json.loads(result.stdout)
         names = [agent["name"] for agent in data["agents"]]
-        self.assertEqual(names, ["agy", "codex", "claude", "opencode", "cursor"])
+        self.assertEqual(
+            names,
+            [
+                "agy",
+                "codex",
+                "devin",
+                "claude",
+                "opencode",
+                "cursor",
+                "greptile",
+                "kiro",
+                "gemma3",
+                "qwen3",
+                "llama3",
+            ],
+        )
 
     def test_discovery_no_agents_is_valid_state(self) -> None:
         empty_bin = self.root / "empty-bin"
@@ -93,6 +141,16 @@ class ScriptChecks(unittest.TestCase):
         text_result = self.run_command([sys.executable, str(DISCOVER), "--refresh"])
         self.assertEqual(text_result.returncode, 0, text_result.stdout)
         self.assertIn("No supported AI coding agent CLIs found", text_result.stdout)
+
+    def test_ollama_model_fallback_resolution(self) -> None:
+        env_name = "AI_FRIEND_OLLAMA_GEMMA3_MODEL"
+        original = os.environ.pop(env_name, None)
+        try:
+            self.assertEqual(discover_agents.resolve_ollama_model("gemma3", {"gemma3:4b"}), "gemma3:4b")
+            self.assertIsNone(discover_agents.resolve_ollama_model("gemma3", {"qwen3:0.6b"}))
+        finally:
+            if original is not None:
+                os.environ[env_name] = original
 
     def test_ranked_dry_run_prefers_external_reviewers(self) -> None:
         repo = self.make_git_repo()
@@ -116,6 +174,7 @@ class ScriptChecks(unittest.TestCase):
         self.assertIn("- agy:", result.stdout)
         self.assertIn("- claude:", result.stdout)
         self.assertIn("- opencode:", result.stdout)
+        self.assertNotIn("- devin:", result.stdout)
         self.assertNotIn("- codex:", result.stdout)
 
     def test_explicit_reviewers_and_include_self(self) -> None:
@@ -151,7 +210,7 @@ class ScriptChecks(unittest.TestCase):
                 "--current-agent",
                 "codex",
                 "--count",
-                "4",
+                "5",
                 "--include-self",
                 "--refresh",
             ],
@@ -160,6 +219,125 @@ class ScriptChecks(unittest.TestCase):
         self.assertEqual(include_self.returncode, 0, include_self.stdout)
         self.assertIn("- codex:", include_self.stdout)
         self.assertIn(" exec --sandbox read-only ", include_self.stdout)
+
+    def test_new_reviewers_build_expected_dry_run_commands(self) -> None:
+        repo = self.make_git_repo()
+        result = self.run_command(
+            [
+                sys.executable,
+                str(RUN_REVIEW),
+                "--dry-run",
+                "--uncommitted",
+                "--reviewers",
+                "cursor,kiro,devin,gemma3,qwen3,llama3",
+                "--refresh",
+            ],
+            repo,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("- cursor:", result.stdout)
+        self.assertIn(" agent --print --mode plan --sandbox enabled ", result.stdout)
+        self.assertIn("- kiro:", result.stdout)
+        self.assertIn(" chat --no-interactive --trust-tools=fs_read --wrap never ", result.stdout)
+        self.assertIn("- devin:", result.stdout)
+        self.assertIn(" -p --permission-mode auto --sandbox --prompt-file ", result.stdout)
+        self.assertIn("- gemma3:", result.stdout)
+        self.assertIn("ollama run gemma3:1b --nowordwrap", result.stdout)
+        self.assertIn("- qwen3:", result.stdout)
+        self.assertIn("ollama run qwen3:0.6b --nowordwrap --think=false --hidethinking", result.stdout)
+        self.assertIn("- llama3:", result.stdout)
+        self.assertIn("review prompt sent over stdin", result.stdout)
+
+    def test_ollama_reviewer_uses_generated_review_prompt(self) -> None:
+        args = argparse.Namespace(
+            commit=None,
+            path=None,
+            base=None,
+            prompt_file=Path("/tmp/prompt.txt"),
+            review_prompt="standardized prompt text",
+        )
+        command = run_review.build_command(
+            {"name": "gemma3", "path": "ollama", "model": "gemma3:1b"},
+            args,
+            REPO_ROOT,
+        )
+        self.assertIsNotNone(command)
+        assert command
+        self.assertEqual(command.stdin, "standardized prompt text")
+
+    def test_greptile_requires_base_target(self) -> None:
+        repo = self.make_git_repo()
+        uncommitted_review = self.run_command(
+            [
+                sys.executable,
+                str(RUN_REVIEW),
+                "--dry-run",
+                "--uncommitted",
+                "--reviewers",
+                "greptile",
+                "--refresh",
+            ],
+            repo,
+        )
+        self.assertNotEqual(uncommitted_review.returncode, 0)
+        self.assertIn("Reviewer(s) cannot run for this target: greptile (supports --base only)", uncommitted_review.stdout)
+
+        args = argparse.Namespace(
+            commit=None,
+            path=None,
+            base="main",
+            prompt_file=Path("/tmp/prompt.txt"),
+        )
+        command = run_review.build_command({"name": "greptile", "path": "greptile"}, args, REPO_ROOT)
+        self.assertIsNotNone(command)
+        assert command
+        self.assertEqual(command.command, ["greptile", "review", "--agent", "--no-color", "--branch", "main"])
+
+        path_review = self.run_command(
+            [
+                sys.executable,
+                str(RUN_REVIEW),
+                "--dry-run",
+                "--path",
+                "example.txt",
+                "--reviewers",
+                "greptile",
+                "--refresh",
+            ],
+            repo,
+        )
+        self.assertNotEqual(path_review.returncode, 0)
+        self.assertIn("Reviewer(s) cannot run for this target: greptile (supports --base only)", path_review.stdout)
+
+    def test_auto_ranked_greptile_skips_for_uncommitted_target(self) -> None:
+        repo = self.make_git_repo()
+        self.env["AI_FRIEND_REVIEWER_RANKING"] = "greptile,agy"
+        result = self.run_command(
+            [
+                sys.executable,
+                str(RUN_REVIEW),
+                "--dry-run",
+                "--uncommitted",
+                "--count",
+                "2",
+                "--refresh",
+            ],
+            repo,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Skipped reviewer(s): greptile (supports --base only)", result.stdout)
+        self.assertIn("- agy:", result.stdout)
+        self.assertNotIn("- greptile:", result.stdout)
+
+    def test_greptile_rejected_for_commit_target(self) -> None:
+        args = argparse.Namespace(
+            commit="abc1234",
+            path=None,
+            base=None,
+            prompt_file=Path("/tmp/prompt.txt"),
+        )
+        command = run_review.build_command({"name": "greptile", "path": "greptile"}, args, REPO_ROOT)
+        self.assertIsNone(command)
 
     def test_aggregation_clusters_structured_findings(self) -> None:
         outputs = {

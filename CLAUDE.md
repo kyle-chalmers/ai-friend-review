@@ -12,9 +12,14 @@ Keep changes small and reviewable. Preserve read-only reviewer behavior, avoid
 machine-specific assumptions in public files, and verify helper scripts before
 claiming they work.
 
-The current design uses one standardized review prompt for all reviewers and
-tool-specific invocation adapters only. Reports include a first-pass
-`Aggregated Findings` section, but external AI findings are still leads until
-verified against code, tests, or command output.
+The current design uses one standardized review prompt for prompt-based
+reviewers and tool-specific invocation adapters only. Greptile uses its native
+diff review flow. Reports include a first-pass `Aggregated Findings` section,
+but external AI findings are still leads until verified against code, tests, or
+command output.
+
+Devin, Cursor Agent, Greptile, Kiro, and local Ollama model reviewers are
+supported when installed and configured. Greptile uses native diff review
+behavior, and Ollama reviewers receive the standardized prompt over stdin.
 
 Run the verification commands listed in `AGENTS.md` before shipping changes.

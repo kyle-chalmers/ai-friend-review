@@ -27,12 +27,52 @@ Headless reviewers supported today:
 
 - `agy` (Antigravity CLI)
 - `claude`
+- `devin`
 - `opencode`
 - `codex`
+- `cursor` (Cursor Agent)
+- `greptile` (native branch/diff review)
+- `kiro`
+- `gemma3` through local Ollama
+- `qwen3` through local Ollama
+- `llama3` through local Ollama
 
-`cursor` is detected for inventory only. Gemini CLI is not used as a reviewer.
-The `~/.gemini/antigravity-cli/skills` install path is kept only because local
-Antigravity-style skill loading may use that directory.
+Gemini CLI is not used as a reviewer. The `~/.gemini/antigravity-cli/skills`
+install path is kept only because local Antigravity-style skill loading may use
+that directory.
+
+Ollama reviewers are discovered when `ollama` is installed and a matching local
+model is available. Discovery prefers these exact default tags, then falls back
+to another installed tag with the same base model name:
+
+- `gemma3`: `gemma3:1b`
+- `qwen3`: `qwen3:0.6b`
+- `llama3`: `llama3:8b-instruct-q2_K`
+
+Model references:
+
+- Gemma 3: https://huggingface.co/blog/gemma3
+- Qwen: https://qwen.ai/home
+- Llama 3 on Ollama: https://ollama.com/library/llama3
+
+Override local model names without editing the repo:
+
+```bash
+AI_FRIEND_OLLAMA_GEMMA3_MODEL=gemma3:4b
+AI_FRIEND_OLLAMA_QWEN3_MODEL=qwen3:4b
+AI_FRIEND_OLLAMA_LLAMA3_MODEL=llama3:8b
+```
+
+Greptile is a native review adapter. It reviews repository diffs through
+`greptile review` instead of reading the shared prompt file. Use it with
+`--base` after committing branch changes; it is not used for `--uncommitted`,
+`--path`, or `--commit`. Kiro support uses the `kiro-cli-chat` binary and
+assumes Kiro CLI authentication is already configured.
+
+If an auto-ranked reviewer cannot handle the chosen target, the runner skips it
+with a notice and continues with the remaining reviewers. If you explicitly
+request that reviewer with `--reviewer` or `--reviewers`, the runner exits so
+the mismatch is visible.
 
 ## Install
 
@@ -98,9 +138,14 @@ python3 skills/ai-friend-review/scripts/run_review.py --count 4 --include-self
 ```
 
 By default, the runner uses up to 3 ranked reviewers. Default ranking is
-`agy, claude, opencode, codex`. Override it with
-`AI_FRIEND_REVIEWER_RANKING=opencode,agy,claude` when you want a different
-preference without editing the skill.
+`agy, claude, devin, opencode, codex, cursor, greptile, kiro, gemma3, qwen3, llama3`.
+Override it with `AI_FRIEND_REVIEWER_RANKING=opencode,cursor,agy` when you want
+a different preference without editing the skill.
+
+Some reviewers only support specific targets. For example, Greptile is eligible
+for `--base` reviews only. Ranked selection skips incompatible reviewers, while
+explicit reviewer selection fails fast so you know the requested reviewer did
+not run.
 
 Install locations can be overridden with environment variables:
 

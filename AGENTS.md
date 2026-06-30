@@ -9,9 +9,10 @@ notes here. Internal-only material belongs in `.internal/`, which is gitignored.
 A portable coding-agent skill in `skills/ai-friend-review/` that discovers local
 AI coding agents and runs read-only multi-AI code review passes.
 
-The skill uses one standardized review prompt for all reviewers. Only the CLI
-invocation adapter differs by tool. Reports include a first-pass
-`Aggregated Findings` section plus raw reviewer output.
+The skill uses one standardized review prompt for prompt-based reviewers. Only
+the CLI invocation adapter differs by tool. Greptile uses its native diff review
+flow. Reports include a first-pass `Aggregated Findings` section plus raw
+reviewer output.
 
 ## Layout
 
@@ -29,8 +30,11 @@ Keep the skill source portable. Do not hardcode local user paths into
 `SKILL.md`; put local discovery in scripts or the cache. Keep reviewer behavior
 read-only by default. Treat external AI findings as leads until verified.
 
-Gemini CLI is not a reviewer. The `~/.gemini/antigravity-cli/skills` path is
-kept only for Antigravity-style skill loading.
+Gemini CLI is not a reviewer. Devin, Cursor Agent, Greptile, Kiro, and local
+Ollama model reviewers are supported when installed and configured. Greptile
+uses a native diff review adapter, and Ollama reviewers receive the standardized
+prompt over stdin. The `~/.gemini/antigravity-cli/skills` path is kept only for
+Antigravity-style skill loading.
 
 ## Verification
 

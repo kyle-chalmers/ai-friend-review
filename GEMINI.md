@@ -12,9 +12,14 @@ Gemini CLI is not a reviewer for this project. The Antigravity-style skill path
 under `~/.gemini/antigravity-cli/skills` may still be used for local skill
 loading.
 
-Preserve the shared-prompt design: all reviewers receive the same review goal
-and rubric, while each CLI gets its own invocation adapter. Reports include
-first-pass aggregation, but the organizing agent must verify findings before
-treating them as true.
+Devin, Cursor Agent, Greptile, Kiro, and local Ollama model reviewers are
+supported when installed and configured. Greptile uses native diff review
+behavior, and Ollama reviewers receive the standardized prompt over stdin.
+
+Preserve the shared-prompt design for prompt-based reviewers: they receive the
+same review goal and rubric, while each CLI gets its own invocation adapter.
+Greptile uses its native diff review flow. Reports include first-pass
+aggregation, but the organizing agent must verify findings before treating them
+as true.
 
 Run the verification commands listed in `AGENTS.md` before shipping changes.
