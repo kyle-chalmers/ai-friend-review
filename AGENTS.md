@@ -30,11 +30,11 @@ Keep the skill source portable. Do not hardcode local user paths into
 `SKILL.md`; put local discovery in scripts or the cache. Keep reviewer behavior
 read-only by default. Treat external AI findings as leads until verified.
 
-Gemini CLI is not a reviewer. Devin, Cursor Agent, Greptile, Kiro, and local
-Ollama model reviewers are supported when installed and configured. Greptile
-uses a native diff review adapter, and Ollama reviewers receive the standardized
-prompt over stdin. The `~/.gemini/antigravity-cli/skills` path is kept only for
-Antigravity-style skill loading.
+Devin, Cursor Agent, Greptile, Kiro, and local Ollama model reviewers are
+supported when installed and configured. Greptile uses a native diff review
+adapter, and Ollama reviewers receive the standardized prompt over stdin. The
+`~/.gemini/antigravity-cli/skills` path is Antigravity's skill-loading
+directory, kept only for that purpose.
 
 ## Verification
 

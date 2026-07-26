@@ -37,10 +37,6 @@ Headless reviewers supported today:
 - `qwen3` through local Ollama
 - `llama3` through local Ollama
 
-Gemini CLI is not used as a reviewer. The `~/.gemini/antigravity-cli/skills`
-install path is kept only because local Antigravity-style skill loading may use
-that directory.
-
 Ollama reviewers are discovered when `ollama` is installed and a matching local
 model is available. Discovery prefers these exact default tags, then falls back
 to another installed tag with the same base model name:

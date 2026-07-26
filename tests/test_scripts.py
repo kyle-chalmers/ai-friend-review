@@ -55,7 +55,7 @@ class ScriptChecks(unittest.TestCase):
         self.bin = self.root / "bin"
         self.cache = self.root / "cache"
         self.bin.mkdir()
-        for name in ["agy", "codex", "devin", "claude", "opencode", "cursor", "greptile", "kiro-cli-chat", "gemini"]:
+        for name in ["agy", "codex", "devin", "claude", "opencode", "cursor", "greptile", "kiro-cli-chat"]:
             write_fake_cli(self.bin, name)
         write_fake_cli(
             self.bin,
@@ -108,7 +108,7 @@ echo "ollama fake reviewer"
         (repo / "example.txt").write_text("hello\n")
         return repo
 
-    def test_discovery_ignores_gemini_cli_reviewer(self) -> None:
+    def test_discovery_finds_all_supported_reviewers(self) -> None:
         result = self.run_command([sys.executable, str(DISCOVER), "--refresh", "--json"])
         self.assertEqual(result.returncode, 0, result.stdout)
         data = json.loads(result.stdout)
