@@ -50,25 +50,56 @@ If an auto-ranked reviewer cannot handle the selected target, the runner skips i
 
 Supported local CLIs are discovered from PATH:
 
-- `agy` (Antigravity CLI)
+- `agy` (Antigravity CLI) — opt-in
 - `codex`
 - `devin`
 - `claude`
 - `opencode`
-- `cursor` (Cursor Agent)
-- `greptile` (native branch/diff review)
+- `cursor` (Cursor Agent) — opt-in
+- `greptile` (native branch/diff review) — opt-in
 - `kiro`
 - `ollama` local model reviewers: `gemma3`, `qwen3`, and `llama3`
 
-Default reviewer ranking is `agy, claude, devin, opencode, codex, cursor, greptile, kiro, gemma3, qwen3, llama3`. Override it without editing the skill by setting `AI_FRIEND_REVIEWER_RANKING`, for example:
+Default reviewer ranking is `opencode, devin, codex, gemma3, qwen3, claude, llama3, kiro`, ordered by observed reliability rather than capability. `cursor`, `agy`, and `greptile` are **opt-in only** — they are not selected automatically, because account-quota exhaustion and target mismatch make them fail often enough that they crowd out reviewers that would have run. Request them explicitly when you want them:
 
 ```bash
-AI_FRIEND_REVIEWER_RANKING=opencode,cursor,agy python3 <skill-dir>/scripts/run_review.py --count 2
+python3 <skill-dir>/scripts/run_review.py --reviewers cursor,agy
+AI_FRIEND_REVIEWER_RANKING=opencode,codex python3 <skill-dir>/scripts/run_review.py --count 2
 ```
 
 Ollama model reviewers are discovered when `ollama` is on PATH and a matching local model is installed. Discovery prefers the exact default tags `gemma3:1b`, `qwen3:0.6b`, and `llama3:8b-instruct-q2_K`, then falls back to another installed tag with the same base model name. Override model names with `AI_FRIEND_OLLAMA_GEMMA3_MODEL`, `AI_FRIEND_OLLAMA_QWEN3_MODEL`, and `AI_FRIEND_OLLAMA_LLAMA3_MODEL`.
 
 The discovery cache lives at `${XDG_CACHE_HOME:-~/.cache}/ai-friend-review/agents.json`. It stores executable paths, versions, and safe invocation templates only. Never inspect auth files, tokens, shell history, private chat logs, or model transcripts.
+
+## Reviewer Failure
+
+A reviewer that did not run is not a reviewer that approved. Every result is classified, and the classification appears in the report next to the exit code:
+
+| Status | Meaning | Retried? |
+|---|---|---|
+| `OK` | Ran and produced output | — |
+| `QUOTA` | Account or session limit hit | No, when the CLI states a reset beyond ~60s. Retrying inside a lockout cannot succeed; the reset time is recorded instead. |
+| `TIMEOUT` | Exceeded `--timeout` | Yes, twice, backing off 5s then 20s |
+| `EMPTY_OUTPUT` | Exit 0 but nothing returned | Yes, twice |
+| `NOT_INSTALLED` | CLI missing or failed to launch | No |
+| `UNSUPPORTED_TARGET` | Adapter cannot review this target | No |
+| `ADAPTER_ERROR` | Bad flags or an unrecognized failure | No |
+
+A preflight probe checks each reviewer's CLI before spending a full review, so a dead roster is reported in seconds instead of after the first reviewer burns its timeout. Skip it with `--skip-preflight`.
+
+`--timeout` has a floor of 120s. A reviewer given too little time reports a timeout indistinguishable from a hung CLI — one run at `--timeout 15` killed four reviewers at once and read as flakiness.
+
+Every run appends per-reviewer outcomes to `${XDG_CACHE_HOME:-~/.cache}/ai-friend-review/reliability.jsonl`, which is what makes the ranking above evidence rather than opinion.
+
+## Machine-Readable Output
+
+`--json-out PATH` writes the run as structured JSON for downstream gates: per reviewer an `id`, `status`, `exit_code`, `attempts`, `error_class`, `error_text`, `reset_at`, and parsed `findings`, plus the target's `head_sha` and `base_sha`.
+
+```bash
+python3 <skill-dir>/scripts/run_review.py --base main --json-out /tmp/review.json
+```
+
+This exists so a consumer can answer "did codex actually run?" by reading a field rather than grepping prose. The process exits 0 only when every reviewer returned `OK`, and 2 otherwise.
 
 ## Review Standard
 

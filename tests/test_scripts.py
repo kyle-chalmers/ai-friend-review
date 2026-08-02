@@ -464,5 +464,101 @@ FINDINGS""",
         self.assertIn("--path does not exist or match a tracked file", result.stdout)
 
 
+class FailureClassification(unittest.TestCase):
+    """A reviewer that did not run must never be indistinguishable from one that approved.
+
+    Every string below was observed in a real stored review under .ai-friend-review/reviews/.
+    """
+
+    def test_quota_messages_classify_as_quota(self) -> None:
+        for output in [
+            "Error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 63h51m48s.",
+            "ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage",
+            "You've hit your session limit · resets 10:30pm (America/Phoenix)",
+        ]:
+            with self.subTest(output=output[:40]):
+                self.assertEqual(run_review.classify_outcome(1, output), run_review.STATUS_QUOTA)
+
+    def test_other_failures_classify_distinctly(self) -> None:
+        cases = [
+            (124, "Reviewer timed out after 900s.", run_review.STATUS_TIMEOUT),
+            (127, "Reviewer launch failed: [Errno 2] No such file or directory", run_review.STATUS_NOT_INSTALLED),
+            (2, "error: the argument '--uncommitted' cannot be used with '[PROMPT]'", run_review.STATUS_ADAPTER_ERROR),
+            (1, "error: there are no committed code changes to review against main", run_review.STATUS_UNSUPPORTED_TARGET),
+            (0, "", run_review.STATUS_EMPTY_OUTPUT),
+            (0, "### Finding: x\n- **Severity**: P1", run_review.STATUS_OK),
+        ]
+        for code, output, expected in cases:
+            with self.subTest(code=code):
+                self.assertEqual(run_review.classify_outcome(code, output), expected)
+
+    def test_quota_reset_gates_retry(self) -> None:
+        # A long lockout must not be retried; a short one may be.
+        _, long_wait = run_review.parse_quota_reset("Resets in 63h51m48s.")
+        self.assertGreater(long_wait, run_review.QUOTA_RETRY_MAX_WAIT_SECONDS)
+        _, short_wait = run_review.parse_quota_reset("resets in 45s")
+        self.assertLessEqual(short_wait, run_review.QUOTA_RETRY_MAX_WAIT_SECONDS)
+        # A clock time carries no date or timezone; guessing one would produce a
+        # confidently wrong retry decision, so it is treated as a long wait.
+        _, clock_wait = run_review.parse_quota_reset("resets 10:30pm (America/Phoenix)")
+        self.assertEqual(clock_wait, float("inf"))
+        self.assertEqual(run_review.parse_quota_reset("nothing here"), (None, None))
+
+    def test_quota_is_not_retried_but_timeout_is(self) -> None:
+        calls = {"n": 0}
+
+        def fake_run(command, root, timeout):  # noqa: ARG001
+            calls["n"] += 1
+            return 1, "Individual quota reached. Resets in 63h51m48s."
+
+        original = run_review.run_reviewer
+        run_review.run_reviewer = fake_run
+        try:
+            outcome = run_review.run_reviewer_with_retries(
+                run_review.ReviewCommand(name="agy", command=["agy"]), Path("."), 900, sleeper=lambda _: None
+            )
+        finally:
+            run_review.run_reviewer = original
+        self.assertEqual(outcome.status, run_review.STATUS_QUOTA)
+        self.assertEqual(calls["n"], 1, "a long quota lockout must not be retried")
+        self.assertFalse(outcome.ok)
+        self.assertIn("quota lockout", outcome.retries_skipped_reason)
+
+        calls["n"] = 0
+
+        def fake_timeout(command, root, timeout):  # noqa: ARG001
+            calls["n"] += 1
+            return 124, "Reviewer timed out after 900s."
+
+        run_review.run_reviewer = fake_timeout
+        try:
+            outcome = run_review.run_reviewer_with_retries(
+                run_review.ReviewCommand(name="devin", command=["devin"]), Path("."), 900, sleeper=lambda _: None
+            )
+        finally:
+            run_review.run_reviewer = original
+        self.assertEqual(outcome.status, run_review.STATUS_TIMEOUT)
+        self.assertEqual(calls["n"], 3, "a timeout gets the original attempt plus two retries")
+
+    def test_opt_in_reviewers_are_not_auto_selected(self) -> None:
+        agents = [{"name": name} for name in ["cursor", "agy", "greptile", "opencode", "codex"]]
+        selected = run_review.select_reviewers(agents, [], None, False, None)
+        names = {agent["name"] for agent in selected}
+        self.assertFalse(names & run_review.OPT_IN_REVIEWERS, f"opt-in reviewer auto-selected: {names}")
+
+    def test_opt_in_reviewers_are_reachable_when_requested(self) -> None:
+        agents = [{"name": name} for name in ["cursor", "opencode"]]
+        selected = run_review.select_reviewers(agents, ["cursor"], None, False, None)
+        self.assertEqual([agent["name"] for agent in selected], ["cursor"])
+
+    def test_timeout_floor_is_enforced(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(RUN_REVIEW), "--uncommitted", "--timeout", "15"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--timeout must be at least", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

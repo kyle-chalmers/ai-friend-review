@@ -9,18 +9,81 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DISCOVER_SCRIPT = SCRIPT_DIR / "discover_agents.py"
 SEVERITY_RE = re.compile(r"\bP[0-3]\b")
-DEFAULT_REVIEWER_RANKING = ["agy", "claude", "devin", "opencode", "codex", "cursor", "greptile", "kiro", "gemma3", "qwen3", "llama3"]
+# Ordered by observed reliability, not capability. Reviewers whose CLIs fail most often
+# on account quota (cursor, agy) or on target mismatch (greptile) are excluded from the
+# default roster and must be requested explicitly with --reviewer.
+DEFAULT_REVIEWER_RANKING = ["opencode", "devin", "codex", "gemma3", "qwen3", "claude", "llama3", "kiro"]
+OPT_IN_REVIEWERS = {"cursor", "agy", "greptile"}
 MAX_PROMPT_CONTEXT_CHARS = 60000
 MAX_UNTRACKED_FILE_CHARS = 12000
 DISCOVERY_TIMEOUT_SECONDS = 30
+# A reviewer given too little time reports a timeout that is indistinguishable from a
+# hung CLI. One run at --timeout 15 killed four reviewers at once and read as flakiness.
+MIN_TIMEOUT_SECONDS = 120
+RETRY_BACKOFF_SECONDS = (5, 20)
+# Retrying inside a quota lockout cannot succeed. Only retry when the CLI reports a reset
+# sooner than this; otherwise record the reset time and stop burning wall clock.
+QUOTA_RETRY_MAX_WAIT_SECONDS = 60
+PREFLIGHT_TIMEOUT_SECONDS = 15
+LEDGER_PATH = Path(
+    os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+) / "ai-friend-review" / "reliability.jsonl"
+
+# Status values are the contract consumed by downstream gates. OK means the reviewer ran
+# and produced output; everything else means it did not, and must never read as approval.
+STATUS_OK = "OK"
+STATUS_QUOTA = "QUOTA"
+STATUS_TIMEOUT = "TIMEOUT"
+STATUS_NOT_INSTALLED = "NOT_INSTALLED"
+STATUS_UNSUPPORTED_TARGET = "UNSUPPORTED_TARGET"
+STATUS_ADAPTER_ERROR = "ADAPTER_ERROR"
+STATUS_EMPTY_OUTPUT = "EMPTY_OUTPUT"
+RETRYABLE_STATUSES = {STATUS_TIMEOUT, STATUS_EMPTY_OUTPUT}
+
+# Matched against combined stdout+stderr. Each pattern is a real message observed from the
+# CLI it names; keep them literal enough that a reworded error falls through to
+# ADAPTER_ERROR rather than being silently misclassified as something benign.
+QUOTA_PATTERNS = (
+    r"individual quota reached",
+    r"you'?ve hit your usage limit",
+    r"you'?ve hit your session limit",
+    r"quota exceeded",
+    r"rate limit(?:ed| exceeded)",
+    r"\b429\b",
+    r"insufficient[_ ]quota",
+)
+NOT_INSTALLED_PATTERNS = (
+    r"reviewer launch failed",
+    r"command not found",
+    r"no such file or directory",
+)
+ADAPTER_ERROR_PATTERNS = (
+    r"cannot be used with",
+    r"unrecognized argument",
+    r"unknown (?:option|flag|argument)",
+    r"invalid (?:option|flag|argument|value)",
+    r"usage: ",
+)
+UNSUPPORTED_TARGET_PATTERNS = (
+    r"no committed code changes to review",
+    r"there are no changes",
+)
+# "Resets in 63h51m48s" / "resets in 50m21s" / "resets in 45s"
+QUOTA_RESET_RELATIVE_RE = re.compile(
+    r"resets? in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?", re.IGNORECASE
+)
+# "resets 10:30pm (America/Phoenix)" — clock time, no date; treated as a long wait because
+# the reset could be up to 24h out and we deliberately do not guess the user's timezone.
+QUOTA_RESET_CLOCK_RE = re.compile(r"resets?\s+(\d{1,2}:\d{2}\s*(?:am|pm)?)", re.IGNORECASE)
 SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 KNOWN_FINDING_LABELS = {
     "severity",
@@ -41,6 +104,78 @@ class ReviewCommand:
     name: str
     command: list[str]
     stdin: str | None = None
+
+
+@dataclass
+class ReviewOutcome:
+    """One reviewer's result, including the reasons it did not produce one.
+
+    This is the record downstream consumers read. `status` is authoritative: anything
+    other than OK means the reviewer did not review, and callers must not treat the
+    absence of findings as an absence of problems.
+    """
+
+    name: str
+    command: list[str]
+    status: str = STATUS_OK
+    exit_code: int | None = None
+    attempts: int = 0
+    output: str = ""
+    error_text: str = ""
+    reset_at: str | None = None
+    retries_skipped_reason: str | None = None
+    findings: list["Finding"] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == STATUS_OK
+
+
+def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def parse_quota_reset(text: str) -> tuple[str | None, float | None]:
+    """Return (iso8601 reset timestamp, seconds until reset) parsed from CLI output.
+
+    Returns (None, None) when no reset is stated. A clock-time reset ("resets 10:30pm")
+    yields a timestamp of None and a deliberately large wait: the message carries no date
+    or timezone, and guessing one would produce a confidently wrong retry decision.
+    """
+    match = QUOTA_RESET_RELATIVE_RE.search(text)
+    if match and any(match.groups()):
+        hours, minutes, seconds = (int(value) if value else 0 for value in match.groups())
+        wait = hours * 3600 + minutes * 60 + seconds
+        if wait > 0:
+            reset_at = datetime.now(timezone.utc) + timedelta(seconds=wait)
+            return reset_at.isoformat(), float(wait)
+    if QUOTA_RESET_CLOCK_RE.search(text):
+        return None, float("inf")
+    return None, None
+
+
+def classify_outcome(exit_code: int, output: str) -> str:
+    """Map an exit code plus reviewer output onto a status.
+
+    Ordering matters: quota is checked before the generic adapter patterns because several
+    CLIs print a usage banner alongside their quota error, and misreading a quota lockout
+    as an adapter bug would send it into a retry loop that cannot succeed.
+    """
+    if exit_code == 124:
+        return STATUS_TIMEOUT
+    if exit_code == 127 or _matches_any(output, NOT_INSTALLED_PATTERNS):
+        return STATUS_NOT_INSTALLED
+    if _matches_any(output, QUOTA_PATTERNS):
+        return STATUS_QUOTA
+    if _matches_any(output, UNSUPPORTED_TARGET_PATTERNS):
+        return STATUS_UNSUPPORTED_TARGET
+    if exit_code != 0 and _matches_any(output, ADAPTER_ERROR_PATTERNS):
+        return STATUS_ADAPTER_ERROR
+    if exit_code != 0:
+        return STATUS_ADAPTER_ERROR
+    if not output.strip():
+        return STATUS_EMPTY_OUTPUT
+    return STATUS_OK
 
 
 @dataclass
@@ -335,7 +470,11 @@ def select_reviewers(
 
     rank = reviewer_ranking()
     ranked_names = [name for name in rank if name in by_name]
-    ranked_names.extend(name for name in by_name if name not in ranked_names)
+    # Reviewers held back for reliability reasons are reachable only by explicit request
+    # (handled above), so they must not leak back in via this catch-all for unranked names.
+    ranked_names.extend(
+        name for name in by_name if name not in ranked_names and name not in OPT_IN_REVIEWERS
+    )
     selected = [
         by_name[name]
         for name in ranked_names
@@ -460,6 +599,81 @@ def run_reviewer(review_command: ReviewCommand, root: Path, timeout: int) -> tup
     except OSError as exc:
         return 127, f"Reviewer launch failed: {exc}"
     return result.returncode, result.stdout.strip()
+
+
+def run_reviewer_with_retries(
+    review_command: ReviewCommand,
+    root: Path,
+    timeout: int,
+    sleeper=time.sleep,
+) -> ReviewOutcome:
+    """Run one reviewer, retrying only failures a retry can plausibly fix.
+
+    Timeouts and empty output get up to two retries with backoff. Quota lockouts do not:
+    the CLI has told us when it resets, and retrying inside that window spends wall clock
+    to arrive at the same failure. The skipped retry is recorded rather than hidden, so a
+    quota failure still reads as a failure downstream.
+    """
+    outcome = ReviewOutcome(name=review_command.name, command=list(review_command.command))
+    for attempt in range(1, len(RETRY_BACKOFF_SECONDS) + 2):
+        exit_code, output = run_reviewer(review_command, root, timeout)
+        status = classify_outcome(exit_code, output)
+        outcome.attempts = attempt
+        outcome.exit_code = exit_code
+        outcome.status = status
+        if status == STATUS_OK:
+            outcome.output = output
+            outcome.error_text = ""
+            return outcome
+
+        outcome.output = output
+        outcome.error_text = output[-2000:]
+        if status == STATUS_QUOTA:
+            reset_at, wait_seconds = parse_quota_reset(output)
+            outcome.reset_at = reset_at
+            if wait_seconds is None or wait_seconds > QUOTA_RETRY_MAX_WAIT_SECONDS:
+                outcome.retries_skipped_reason = (
+                    f"quota lockout; reset_at={reset_at or 'unknown'}"
+                )
+                return outcome
+        elif status not in RETRYABLE_STATUSES:
+            outcome.retries_skipped_reason = f"{status} is not retryable"
+            return outcome
+
+        if attempt <= len(RETRY_BACKOFF_SECONDS):
+            sleeper(RETRY_BACKOFF_SECONDS[attempt - 1])
+    return outcome
+
+
+def preflight(commands: list[ReviewCommand], root: Path) -> dict[str, str]:
+    """Probe each reviewer's CLI for liveness before spending a full review on it.
+
+    Cheap (`--version`, a few seconds each) and worth it: without this, a dead roster is
+    discovered only after the first reviewer has already burned its full timeout.
+    Only NOT_INSTALLED is decided here — quota state is not visible to a version probe.
+    """
+    results: dict[str, str] = {}
+    for item in commands:
+        executable = item.command[0]
+        try:
+            probe = subprocess.run(
+                [executable, "--version"],
+                cwd=str(root),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=PREFLIGHT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # A slow --version is not itself a failure; let the real run decide.
+            results[item.name] = STATUS_OK
+            continue
+        except OSError:
+            results[item.name] = STATUS_NOT_INSTALLED
+            continue
+        results[item.name] = STATUS_OK if probe.returncode == 0 else STATUS_NOT_INSTALLED
+    return results
 
 
 def report_path(root: Path, name: str) -> Path:
@@ -681,6 +895,7 @@ def write_report(
     commands: list[ReviewCommand],
     outputs: dict[str, str],
     exit_codes: dict[str, int],
+    statuses: dict[str, str] | None = None,
 ) -> None:
     lines = [
         f"# AI Friend Review: {target_name(args)}",
@@ -758,20 +973,127 @@ def write_report(
 
     for name, output in outputs.items():
         fence = markdown_fence(output or "")
-        lines.extend(
-            [
-                f"### {name}",
-                "",
-                f"Exit code: `{exit_codes.get(name)}`",
-                "",
-                f"{fence}text",
-                output or "(no output)",
-                fence,
-                "",
-            ]
-        )
+        header = [
+            f"### {name}",
+            "",
+            f"Exit code: `{exit_codes.get(name)}`",
+        ]
+        status = (statuses or {}).get(name)
+        if status:
+            header.append(f"Status: `{status}`")
+            if status != STATUS_OK:
+                header.append("")
+                header.append(
+                    f"**This reviewer did not review.** Treat its silence as unknown, not as approval."
+                )
+        lines.extend(header + ["", f"{fence}text", output or "(no output)", fence, ""])
 
     path.write_text("\n".join(lines))
+
+
+def resolve_shas(args: argparse.Namespace, root: Path) -> tuple[str | None, str | None]:
+    """Best-effort (head_sha, base_sha) for the reviewed target.
+
+    Returns None for either value rather than guessing when the target has no meaningful
+    base (an uncommitted or path review), so a consumer keying on SHA can tell the
+    difference between "not applicable" and "wrong". Every lookup is soft: a repo with no
+    commits, or a root commit with no parent, must degrade to None rather than abort a
+    review that has already been paid for.
+    """
+
+    def soft(*git_args: str) -> str | None:
+        result = run_capture(["git", *git_args], root)
+        return result.stdout.strip() or None if result.returncode == 0 else None
+
+    head = soft("rev-parse", "HEAD")
+    if args.commit:
+        return soft("rev-parse", args.commit), soft("rev-parse", f"{args.commit}^")
+    if args.base:
+        return head, soft("merge-base", args.base, "HEAD")
+    return head, None
+
+
+def build_result_payload(
+    args: argparse.Namespace,
+    root: Path,
+    outcomes: list[ReviewOutcome],
+    prompt_file: Path,
+) -> dict[str, Any]:
+    head_sha, base_sha = resolve_shas(args, root)
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repo": str(root),
+        "target": target_name(args),
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "prompt_file": str(prompt_file),
+        "timeout_seconds": args.timeout,
+        "reviewers": [
+            {
+                "id": outcome.name,
+                "model": outcome.name,
+                "command": command_display(outcome.command),
+                "status": outcome.status,
+                "exit_code": outcome.exit_code,
+                "attempts": outcome.attempts,
+                "error_class": None if outcome.ok else outcome.status,
+                "error_text": outcome.error_text or None,
+                "reset_at": outcome.reset_at,
+                "retries_skipped_reason": outcome.retries_skipped_reason,
+                "findings": [
+                    {
+                        "title": finding.title,
+                        "severity": finding.severity,
+                        "location": finding.location,
+                        "evidence": finding.evidence,
+                        "confidence": finding.confidence,
+                        "why_it_matters": finding.why,
+                        "suggested_fix": finding.fix,
+                    }
+                    for finding in outcome.findings
+                ],
+            }
+            for outcome in outcomes
+        ],
+        "summary": {
+            "total": len(outcomes),
+            "ok": sum(1 for outcome in outcomes if outcome.ok),
+            "failed": sum(1 for outcome in outcomes if not outcome.ok),
+            "findings": sum(len(outcome.findings) for outcome in outcomes),
+        },
+    }
+
+
+def append_ledger(payload: dict[str, Any]) -> None:
+    """Append per-reviewer outcomes to a machine-local reliability log.
+
+    Deliberately outside the repo: this accumulates across every repo reviewed, and it is
+    the evidence for whether a reviewer is worth keeping in the default roster. Failure to
+    write must never take down a review, so all errors are swallowed.
+    """
+    try:
+        LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LEDGER_PATH.open("a", encoding="utf-8") as handle:
+            for reviewer in payload["reviewers"]:
+                handle.write(
+                    json.dumps(
+                        {
+                            "at": payload["generated_at"],
+                            "target": payload["target"],
+                            "head_sha": payload["head_sha"],
+                            "reviewer": reviewer["id"],
+                            "status": reviewer["status"],
+                            "exit_code": reviewer["exit_code"],
+                            "attempts": reviewer["attempts"],
+                            "findings": len(reviewer["findings"]),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -789,8 +1111,16 @@ def main() -> int:
     parser.add_argument("--count", type=int, help="Number of reviewers to use after ranking or explicit selection.")
     parser.add_argument("--refresh", action="store_true", help="Refresh local agent discovery first.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned commands without calling reviewers.")
-    parser.add_argument("--timeout", type=int, default=900, help="Timeout per reviewer in seconds.")
+    parser.add_argument("--timeout", type=int, default=900, help=f"Timeout per reviewer in seconds (minimum {MIN_TIMEOUT_SECONDS}).")
+    parser.add_argument("--json-out", help="Write a machine-readable result file with per-reviewer status and findings.")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip the reviewer liveness probe.")
     args = parser.parse_args()
+
+    if args.timeout < MIN_TIMEOUT_SECONDS:
+        raise SystemExit(
+            f"--timeout must be at least {MIN_TIMEOUT_SECONDS}s. "
+            f"Shorter timeouts report as reviewer failures rather than saving time."
+        )
 
     root = git_root()
     agents = discover_agents(args.refresh)
@@ -843,18 +1173,54 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    outputs: dict[str, str] = {}
-    exit_codes: dict[str, int] = {}
+    if not args.skip_preflight:
+        probe = preflight(commands, root)
+        dead = [name for name, status in probe.items() if status != STATUS_OK]
+        if dead:
+            print(f"Preflight: reviewer(s) not runnable: {', '.join(sorted(dead))}.", flush=True)
+        live = [item for item in commands if probe.get(item.name) == STATUS_OK]
+        if not live:
+            raise SystemExit(
+                "Preflight found no runnable reviewers. "
+                "Run discover_agents.py --refresh, or pass --skip-preflight to try anyway."
+            )
+        commands = live
+
+    outcomes: list[ReviewOutcome] = []
     for item in commands:
         print(f"Running reviewer: {item.name}", flush=True)
-        code, output = run_reviewer(item, root, args.timeout)
-        exit_codes[item.name] = code
-        outputs[item.name] = output
+        outcome = run_reviewer_with_retries(item, root, args.timeout)
+        if outcome.ok:
+            outcome.findings = parse_findings(outcome.name, outcome.output)
+        else:
+            detail = outcome.retries_skipped_reason or f"after {outcome.attempts} attempt(s)"
+            print(f"  {outcome.name}: {outcome.status} ({detail})", flush=True)
+        outcomes.append(outcome)
 
+    outputs = {outcome.name: outcome.output for outcome in outcomes}
+    exit_codes = {outcome.name: outcome.exit_code for outcome in outcomes}
+
+    statuses = {outcome.name: outcome.status for outcome in outcomes}
     path = report_path(root, target_name(args))
-    write_report(path, root, args, commands, outputs, exit_codes)
+    write_report(path, root, args, commands, outputs, exit_codes, statuses)
+
+    payload = build_result_payload(args, root, outcomes, prompt_file)
+    append_ledger(payload)
+    if args.json_out:
+        json_path = Path(args.json_out).expanduser()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        print(f"Result JSON written: {json_path}", flush=True)
 
     print(f"Report written: {path}", flush=True)
+    # Say plainly which reviewers ran and which did not. A reviewer that never ran is the
+    # failure mode this whole path exists to make visible.
+    ran = [outcome.name for outcome in outcomes if outcome.ok]
+    failed = [f"{outcome.name} ({outcome.status})" for outcome in outcomes if not outcome.ok]
+    print(f"Reviewers completed: {len(ran)}/{len(outcomes)}" + (f" — ran: {', '.join(ran)}" if ran else ""), flush=True)
+    if failed:
+        print(f"Reviewers that did NOT review: {', '.join(failed)}", flush=True)
+
     high_signal = extract_high_signal(outputs)
     if high_signal:
         print("High-signal finding lines:", flush=True)
@@ -863,7 +1229,7 @@ def main() -> int:
     else:
         print("No severity-tagged finding lines were detected. Read the report for full reviewer output.", flush=True)
 
-    return 0 if all(code == 0 for code in exit_codes.values()) else 2
+    return 0 if all(outcome.ok for outcome in outcomes) else 2
 
 
 if __name__ == "__main__":
