@@ -94,6 +94,33 @@ A reviewer that did not run is not a reviewer that approved. Every result is cla
 | `UNSUPPORTED_TARGET` | Adapter cannot review this target | No |
 | `ADAPTER_ERROR` | Bad flags or an unrecognized failure | No |
 
+### CLI too old for its configured model
+
+`ADAPTER_ERROR` on a reviewer that is definitely installed usually means its CLI is
+older than the model it is pinned to. Observed with codex:
+
+```
+ERROR: The 'gpt-5.6-terra' model requires a newer version of Codex.
+       Please upgrade to the latest app or CLI and try again.
+```
+
+The reviewer launches fine and exits non-zero, so it is not `NOT_INSTALLED` — the model
+request is rejected server-side. Two remedies, in order:
+
+```bash
+brew upgrade --cask codex     # then re-check: codex --version
+```
+
+If upgrading is not an option, pin the model down instead — `model` in
+`~/.codex/config.toml`. Verify either fix with a cheap round trip before spending a real
+review, since a preflight `--version` probe passes in both the working and broken state:
+
+```bash
+echo "Reply with exactly: OK" | codex exec --sandbox read-only -
+```
+
+Note there is no `timeout` binary on stock macOS, so do not wrap that check in one.
+
 A preflight probe checks each reviewer's CLI before spending a full review, so a dead roster is reported in seconds instead of after the first reviewer burns its timeout. Skip it with `--skip-preflight`.
 
 `--timeout` has a floor of 120s. A reviewer given too little time reports a timeout indistinguishable from a hung CLI — one run at `--timeout 15` killed four reviewers at once and read as flakiness.
