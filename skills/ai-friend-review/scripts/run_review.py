@@ -18,10 +18,13 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 DISCOVER_SCRIPT = SCRIPT_DIR / "discover_agents.py"
 SEVERITY_RE = re.compile(r"\bP[0-3]\b")
-# Ordered by observed reliability, not capability. Reviewers whose CLIs fail most often
-# on account quota (cursor, agy) or on target mismatch (greptile) are excluded from the
-# default roster and must be requested explicitly with --reviewer.
-DEFAULT_REVIEWER_RANKING = ["opencode", "devin", "codex", "gemma3", "qwen3", "claude", "llama3", "kiro"]
+# codex leads by preference: it is the primary non-Anthropic reviewer. Its one recorded
+# failure was an adapter bug (--uncommitted vs a positional prompt) since rewritten, not a
+# quota loss, so its real availability matches opencode's.
+# The rest are ordered by observed reliability, not capability. Reviewers that fail most
+# often on account quota (cursor, agy) or target mismatch (greptile) are off the default
+# roster and must be requested explicitly with --reviewer.
+DEFAULT_REVIEWER_RANKING = ["codex", "opencode", "devin", "gemma3", "qwen3", "claude", "llama3", "kiro"]
 OPT_IN_REVIEWERS = {"cursor", "agy", "greptile"}
 MAX_PROMPT_CONTEXT_CHARS = 60000
 MAX_UNTRACKED_FILE_CHARS = 12000

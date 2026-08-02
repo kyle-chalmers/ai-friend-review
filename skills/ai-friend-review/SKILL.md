@@ -60,7 +60,7 @@ Supported local CLIs are discovered from PATH:
 - `kiro`
 - `ollama` local model reviewers: `gemma3`, `qwen3`, and `llama3`
 
-Default reviewer ranking is `opencode, devin, codex, gemma3, qwen3, claude, llama3, kiro`, ordered by observed reliability rather than capability. `cursor`, `agy`, and `greptile` are **opt-in only** — they are not selected automatically, because account-quota exhaustion and target mismatch make them fail often enough that they crowd out reviewers that would have run. Request them explicitly when you want them:
+Default reviewer ranking is `codex, opencode, devin, gemma3, qwen3, claude, llama3, kiro`. codex leads by preference as the primary non-Anthropic reviewer; the rest are ordered by observed reliability rather than capability. `cursor`, `agy`, and `greptile` are **opt-in only** — they are not selected automatically, because account-quota exhaustion and target mismatch make them fail often enough that they crowd out reviewers that would have run. Request them explicitly when you want them:
 
 ```bash
 python3 <skill-dir>/scripts/run_review.py --reviewers cursor,agy
