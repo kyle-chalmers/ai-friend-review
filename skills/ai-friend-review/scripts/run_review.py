@@ -160,25 +160,42 @@ def parse_quota_reset(text: str) -> tuple[str | None, float | None]:
 def classify_outcome(exit_code: int, output: str) -> str:
     """Map an exit code plus reviewer output onto a status.
 
-    Ordering matters: quota is checked before the generic adapter patterns because several
-    CLIs print a usage banner alongside their quota error, and misreading a quota lockout
-    as an adapter bug would send it into a retry loop that cannot succeed.
+    THE EXIT CODE LEADS. Content patterns are only consulted for a run that actually
+    failed, because a reviewer's output contains its REVIEW -- prose about the code under
+    review, which routinely quotes the same phrases these patterns look for.
+
+    Observed: codex exited 0 with a full review whose text contained "no such file or
+    directory", matched the NOT_INSTALLED pattern, and was reported as never having run.
+    A process that exits 0 with output is installed by definition, and its findings were
+    silently discarded.
+
+    Ordering within the failure branch still matters: quota is checked before the generic
+    adapter patterns because several CLIs print a usage banner alongside their quota error,
+    and misreading a lockout as an adapter bug sends it into a retry that cannot succeed.
     """
     if exit_code == 124:
         return STATUS_TIMEOUT
-    if exit_code == 127 or _matches_any(output, NOT_INSTALLED_PATTERNS):
+    if exit_code == 127:
         return STATUS_NOT_INSTALLED
+
+    if exit_code == 0:
+        if not output.strip():
+            return STATUS_EMPTY_OUTPUT
+        # A CLI that prints a quota error and still exits 0 would otherwise be recorded as
+        # a clean review. Only trust that reading when the output carries no findings at
+        # all -- a real review that merely mentions a rate limit must stay OK.
+        if _matches_any(output, QUOTA_PATTERNS) and not SEVERITY_RE.search(output):
+            return STATUS_QUOTA
+        return STATUS_OK
+
+    # Non-zero exit: now the output is diagnostic text, so pattern matching is meaningful.
     if _matches_any(output, QUOTA_PATTERNS):
         return STATUS_QUOTA
+    if _matches_any(output, NOT_INSTALLED_PATTERNS):
+        return STATUS_NOT_INSTALLED
     if _matches_any(output, UNSUPPORTED_TARGET_PATTERNS):
         return STATUS_UNSUPPORTED_TARGET
-    if exit_code != 0 and _matches_any(output, ADAPTER_ERROR_PATTERNS):
-        return STATUS_ADAPTER_ERROR
-    if exit_code != 0:
-        return STATUS_ADAPTER_ERROR
-    if not output.strip():
-        return STATUS_EMPTY_OUTPUT
-    return STATUS_OK
+    return STATUS_ADAPTER_ERROR
 
 
 @dataclass

@@ -492,6 +492,36 @@ class FailureClassification(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertEqual(run_review.classify_outcome(code, output), expected)
 
+    def test_successful_exit_is_never_reclassified_by_review_content(self) -> None:
+        """A reviewer's output contains its REVIEW, which quotes arbitrary prose.
+
+        Observed: codex exited 0 with a full review mentioning "no such file or
+        directory" and was reported as NOT_INSTALLED, discarding its findings.
+        """
+        review = (
+            "### Finding: missing config\n- **Severity**: P1\n"
+            "- **Evidence**: open() raised No such file or directory\n"
+        )
+        self.assertEqual(run_review.classify_outcome(0, review), run_review.STATUS_OK)
+        for phrase in ["command not found", "no such file or directory", "usage: foo"]:
+            with self.subTest(phrase=phrase):
+                body = f"### Finding: x\n- **Severity**: P2\n- **Evidence**: {phrase}\n"
+                self.assertEqual(run_review.classify_outcome(0, body), run_review.STATUS_OK)
+
+    def test_soft_quota_failure_on_exit_zero_is_still_caught(self) -> None:
+        # No findings + a quota message = the CLI bailed without reviewing.
+        self.assertEqual(
+            run_review.classify_outcome(0, "Error: Individual quota reached. Resets in 2h."),
+            run_review.STATUS_QUOTA,
+        )
+        # But a real review that merely mentions a rate limit stays OK.
+        self.assertEqual(
+            run_review.classify_outcome(
+                0, "### Finding: retry storm\n- **Severity**: P1\n- **Evidence**: 429 rate limit\n"
+            ),
+            run_review.STATUS_OK,
+        )
+
     def test_quota_reset_gates_retry(self) -> None:
         # A long lockout must not be retried; a short one may be.
         _, long_wait = run_review.parse_quota_reset("Resets in 63h51m48s.")
