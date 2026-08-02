@@ -1,7 +1,16 @@
 ---
 name: ai-friend-review
 description: >-
-  Run multi-AI code reviews with local coding agents. Use when the user says "AI friend review", "ask another AI to review this", "multi-AI review", "get a second AI opinion on this diff", "have other AI coding agents review this", or asks for independent AI review of code, plans, diffs, commits, PRs, or implementation work.
+  Run read-only multi-AI code reviews with the local coding-agent CLIs on PATH (codex,
+  opencode, devin, claude, local ollama models) and merge their findings into one report,
+  with each reviewer's run status recorded so a quota failure never reads as approval.
+  Use when the user says "AI friend review", "ask another AI to review this", "multi-AI
+  review", "get a second AI opinion on this diff", or asks for independent AI review of
+  code, plans, diffs, commits, or PRs. Target arguments (pick one, default --uncommitted):
+  --uncommitted, --base <branch>, --commit <sha>, --path <file-or-dir>. Also --json-out
+  <path> for machine-readable per-reviewer status and findings, --reviewers <names> to
+  choose reviewers, --count <n>, --timeout <seconds> (minimum 120), and --dry-run to print
+  the planned commands without spending any AI usage.
 ---
 
 # AI Friend Review
