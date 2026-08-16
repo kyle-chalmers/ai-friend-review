@@ -24,6 +24,13 @@ SEVERITY_RE = re.compile(r"\bP[0-3]\b")
 # The rest are ordered by observed reliability, not capability. Reviewers that fail most
 # often on account quota (cursor, agy) or target mismatch (greptile) are off the default
 # roster and must be requested explicitly with --reviewer.
+# devin's lifetime number in the ledger is misleading and should not be read as flakiness:
+# it failed 100% from 2026-08-02 to 2026-08-14 on a single deterministic cause, the CLI
+# reporting `session/set_mode failed: Mode 'autonomous' is restricted by your
+# organization's policy`, then recovered cleanly on 2026-08-16. That was an account policy
+# and CLI-version condition, not an adapter defect, and it is fixed. Judge a reviewer on
+# its recent runs and its recorded error class, never on a lifetime average that averages
+# across an outage someone already resolved.
 DEFAULT_REVIEWER_RANKING = ["codex", "opencode", "devin", "gemma3", "qwen3", "claude", "llama3", "kiro"]
 OPT_IN_REVIEWERS = {"cursor", "agy", "greptile"}
 MAX_PROMPT_CONTEXT_CHARS = 60000
@@ -443,6 +450,8 @@ def review_prompt(args: argparse.Namespace, root: Path) -> str:
 {root}
 
 Focus on bugs, behavioral regressions, security issues, broken tests, missing validation, and requirement gaps. Do not make edits. Do not give style-only comments unless the style issue creates a real defect.
+
+Scope, and this is a hard rule: every finding must be about code that appears in the target summary below, and must cite the file and line where it appears. If a problem is real but the target did not introduce or touch it, it is out of scope for this review. That includes pre-existing defects elsewhere in the repository, the design or plan behind the change, missing work you think should also have been done, and repository conventions the target did not modify. Report nothing you cannot anchor to a changed line. A short review that stays in scope is more useful than a long one that does not.
 
 Severity rubric:
 - P0: blocks the core workflow, causes data loss, exposes secrets, or creates a critical security issue.
