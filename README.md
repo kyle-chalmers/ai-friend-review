@@ -25,13 +25,13 @@ safe command templates under `${XDG_CACHE_HOME:-~/.cache}/ai-friend-review/`.
 
 Headless reviewers supported today:
 
-- `agy` (Antigravity CLI)
+- `agy` (Antigravity CLI), opt-in
 - `claude`
 - `devin`
 - `opencode`
 - `codex`
-- `cursor` (Cursor Agent)
-- `greptile` (native branch/diff review)
+- `cursor` (Cursor Agent), opt-in
+- `greptile` (native branch/diff review), opt-in
 - `kiro`
 - `gemma3` through local Ollama
 - `qwen3` through local Ollama
@@ -140,9 +140,16 @@ python3 skills/ai-friend-review/scripts/run_review.py --count 4 --include-self
 ```
 
 By default, the runner uses up to 3 ranked reviewers. Default ranking is
-`agy, claude, devin, opencode, codex, cursor, greptile, kiro, gemma3, qwen3, llama3`.
-Override it with `AI_FRIEND_REVIEWER_RANKING=opencode,cursor,agy` when you want
-a different preference without editing the skill.
+`codex, opencode, devin, gemma3, qwen3, claude, llama3, kiro`. codex leads by
+preference; the rest are ordered by observed reliability.
+
+`cursor`, `agy`, and `greptile` are opt-in. Ranked selection skips them unless
+you name them, because account quota limits and target mismatches make them fail
+often enough to crowd out reviewers that would have run. Name them with
+`--reviewers cursor,agy`, or put them in your own ranking:
+`AI_FRIEND_REVIEWER_RANKING=opencode,cursor,agy` tries those three first and
+opts `cursor` and `agy` in. Discovered reviewers you leave out of that list
+follow after it, except the opt-in ones.
 
 Some reviewers only support specific targets. For example, Greptile is eligible
 for `--base` reviews only. Ranked selection skips incompatible reviewers, while
