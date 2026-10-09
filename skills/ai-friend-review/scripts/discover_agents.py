@@ -24,7 +24,16 @@ AGENTS: dict[str, dict[str, Any]] = {
     },
     "codex": {
         "version_args": ["--version"],
-        "review_template": ["codex", "exec", "--sandbox", "read-only", "<prompt-file-instruction>"],
+        "review_template": [
+            "codex",
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            "<last-message-file>",
+            "<prompt-file-instruction>",
+        ],
         "notes": "Use read-only exec mode with a prompt-file instruction for standardized review.",
         "headless_review": True,
     },
@@ -128,6 +137,7 @@ def version_for(path: str, args: list[str]) -> str | None:
         result = subprocess.run(
             [path, *args],
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -159,6 +169,7 @@ def ollama_models(path: str) -> set[str]:
         result = subprocess.run(
             [path, "list"],
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -187,6 +198,7 @@ def ollama_run_help(path: str) -> str:
         result = subprocess.run(
             [path, "run", "--help"],
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

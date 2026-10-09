@@ -7,10 +7,11 @@ description: >-
   Use when the user says "AI friend review", "ask another AI to review this", "multi-AI
   review", "get a second AI opinion on this diff", or asks for independent AI review of
   code, plans, diffs, commits, or PRs. Target arguments (pick one, default --uncommitted):
-  --uncommitted, --base <branch>, --commit <sha>, --path <file-or-dir>. Also --json-out
-  <path> for machine-readable per-reviewer status and findings, --reviewers <names> to
-  choose reviewers, --count <n>, --timeout <seconds> (minimum 120), and --dry-run to print
-  the planned commands without spending any AI usage.
+  --uncommitted, --base BRANCH, --commit SHA, --path FILE_OR_DIR, or --doc FILE to review
+  a plan, spec, or doc in full (works outside git). Also --json-out PATH for
+  machine-readable per-reviewer status and findings, --reviewers NAMES to choose
+  reviewers, --count N, --timeout SECONDS (minimum 120), and --dry-run to print the
+  planned commands without spending any AI usage.
 ---
 
 # AI Friend Review
@@ -45,9 +46,26 @@ Default to reviewing uncommitted changes. Use the smallest target that matches t
 - `--uncommitted`: staged, unstaged, and untracked work.
 - `--base <branch>`: changes from a base branch.
 - `--commit <sha>`: one commit.
-- `--path <file-or-dir>`: focused path review.
+- `--path <file-or-dir>`: uncommitted changes under one path.
+- `--doc <file>`: the full text of a plan, spec, or other document. See below.
+
+`--uncommitted`, `--base`, and `--path` exit with an error when their diff is empty, before any reviewer runs. Reviewers handed nothing to review return the format template unfilled, which used to read as a clean review.
 
 Do not let reviewer agents edit files. Run reviewers in read-only or planning modes where their CLIs support it.
+
+### Reviewing a plan, spec, or doc
+
+Use `--doc`, never `--path`, when the user asks to review a plan or document. `--path` reviews a diff, so a file with no uncommitted changes, or one outside the repository, gives reviewers nothing to see.
+
+```bash
+python3 <skill-dir>/scripts/run_review.py --doc ~/.claude/plans/my-plan.md --reviewers codex
+```
+
+`--doc` sends the whole file, with line numbers, and swaps the code rubric for a document rubric: wrong or unsupported factual claims, requirement gaps, feasibility and sequencing, risk (security, legal, operational), and internal inconsistency. Findings use the same P0 to P3 format, so the report aggregates them the same way.
+
+The file does not need to be in a git repository. Reviewers run from the current repo when there is one, so they can check the document's claims against the code; otherwise they run from the document's folder, and the prompt and report land in a `.ai-friend-review/` folder beside it. Greptile reviews diffs only and is skipped for `--doc`.
+
+A document longer than the prompt budget (60,000 characters once line numbers are added) is refused rather than cut off, since a reviewer that never saw the end would read as approving all of it. Split it and review each part.
 
 ## Reviewer Selection
 
@@ -89,7 +107,7 @@ A reviewer that did not run is not a reviewer that approved. Every result is cla
 | `OK` | Ran and produced output | — |
 | `QUOTA` | Account or session limit hit | No, when the CLI states a reset beyond ~60s. Retrying inside a lockout cannot succeed; the reset time is recorded instead. |
 | `TIMEOUT` | Exceeded `--timeout` | Yes, twice, backing off 5s then 20s |
-| `EMPTY_OUTPUT` | Exit 0 but nothing returned | Yes, twice |
+| `EMPTY_OUTPUT` | Exit 0 but nothing returned, or only the prompt's finding template copied back unfilled (a literal `<short title>`) | Yes, twice |
 | `NOT_INSTALLED` | CLI missing or failed to launch | No |
 | `UNSUPPORTED_TARGET` | Adapter cannot review this target | No |
 | `ADAPTER_ERROR` | Bad flags or an unrecognized failure | No |
@@ -127,6 +145,18 @@ A preflight probe checks each reviewer's CLI before spending a full review, so a
 
 Every run appends per-reviewer outcomes to `${XDG_CACHE_HOME:-~/.cache}/ai-friend-review/reliability.jsonl`, which is what makes the ranking above evidence rather than opinion.
 
+### Long runs and ad-hoc CLI calls
+
+A full review can outlast a foreground shell command. Each reviewer gets `--timeout` (default 900s) and up to two retries, and reviewers run one after another. Claude Code's Bash tool stops a foreground command after 2 minutes by default and 10 at most, so launch the runner as a background command there and read the report when it exits. Use the equivalent in other harnesses.
+
+When calling a reviewer CLI directly instead of through the runner, close its stdin. `codex exec` (observed on 0.160) appends piped stdin to the prompt and waits for EOF, and an agent's shell tool may never close the stdin it hands a command, so the call hangs while printing `Reading additional input from stdin...`:
+
+```bash
+codex exec --sandbox read-only --skip-git-repo-check -o /tmp/answer.md "<prompt>" < /dev/null
+```
+
+The runner already gives every reviewer a closed stdin, except Ollama reviewers, which receive the prompt over stdin on purpose.
+
 ## Machine-Readable Output
 
 `--json-out PATH` writes the run as structured JSON for downstream gates: per reviewer an `id`, `status`, `exit_code`, `attempts`, `error_class`, `error_text`, `reset_at`, and parsed `findings`, plus the target's `head_sha` and `base_sha`.
@@ -142,7 +172,7 @@ This exists so a consumer can answer "did codex actually run?" by reading a fiel
 Prompt-based reviewers receive the same standardized review goal and rubric. The runner only adapts how each CLI is invoked:
 
 - `agy`: `agy --print <short prompt-file instruction> --sandbox`
-- `codex`: `codex exec --sandbox read-only <short prompt-file instruction>`.
+- `codex`: `codex exec --sandbox read-only --skip-git-repo-check --output-last-message <run-dir file> <short prompt-file instruction>`. The runner parses the last-message file in `.ai-friend-review/outputs/` rather than stdout, where codex prints its final message twice. `--skip-git-repo-check` lets `--doc` reviews run outside git; the read-only sandbox already covers what that check protects.
 - `devin`: `devin -p --permission-mode auto --sandbox --prompt-file <prompt-file>`
 - `claude`: `claude -p --permission-mode plan <short prompt-file instruction>`
 - `opencode`: `opencode run --agent plan --dir <repo> <short prompt-file instruction>`
