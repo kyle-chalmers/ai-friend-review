@@ -62,7 +62,7 @@ AI_FRIEND_OLLAMA_LLAMA3_MODEL=llama3:8b
 Greptile is a native review adapter. It reviews repository diffs through
 `greptile review` instead of reading the shared prompt file. Use it with
 `--base` after committing branch changes; it is not used for `--uncommitted`,
-`--path`, or `--commit`. Kiro support uses the `kiro-cli-chat` binary and
+`--path`, `--commit`, or `--doc`. Kiro support uses the `kiro-cli-chat` binary and
 assumes Kiro CLI authentication is already configured.
 
 If an auto-ranked reviewer cannot handle the chosen target, the runner skips it
@@ -123,7 +123,13 @@ python3 skills/ai-friend-review/scripts/run_review.py --uncommitted
 python3 skills/ai-friend-review/scripts/run_review.py --base main
 python3 skills/ai-friend-review/scripts/run_review.py --commit abc1234
 python3 skills/ai-friend-review/scripts/run_review.py --path skills/ai-friend-review
+python3 skills/ai-friend-review/scripts/run_review.py --doc PLAN.md
 ```
+
+`--path` reviews the uncommitted diff under a path. Every diff target exits with
+an error when its diff is empty, instead of running reviewers on nothing. To review a plan, spec, or other document in full, use
+`--doc <file>`. It sends the whole file with a plan-review rubric and works
+outside a git repository.
 
 Choose exact reviewers or a count:
 

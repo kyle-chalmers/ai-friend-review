@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DISCOVER_SCRIPT = SCRIPT_DIR / "discover_agents.py"
@@ -95,6 +95,13 @@ QUOTA_RESET_RELATIVE_RE = re.compile(
 # the reset could be up to 24h out and we deliberately do not guess the user's timezone.
 QUOTA_RESET_CLOCK_RE = re.compile(r"resets?\s+(\d{1,2}:\d{2}\s*(?:am|pm)?)", re.IGNORECASE)
 SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+# A finding with several fields made only of <angle-bracket> tokens is the prompt's format
+# block copied back unfilled. Observed: codex handed an empty target returned the block
+# verbatim, which parsed as a P0 finding titled "<short title>" on a run that reported OK.
+# One such field alone is not enough: real findings have titles like `<Suspense>` and
+# locations like <unknown>.
+TEMPLATE_PLACEHOLDER_RE = re.compile(r"^(?:<[^<>\n]+>[\s:]*)+$")
+TEMPLATE_ECHO_MIN_FIELDS = 2
 KNOWN_FINDING_LABELS = {
     "severity",
     "location",
@@ -114,6 +121,9 @@ class ReviewCommand:
     name: str
     command: list[str]
     stdin: str | None = None
+    # Where the reviewer writes its final answer, for CLIs that can. Read instead of
+    # stdout on a clean exit, because stdout mixes the answer with progress output.
+    output_file: Path | None = None
 
 
 @dataclass
@@ -186,7 +196,7 @@ def classify_outcome(exit_code: int, output: str) -> str:
         return STATUS_NOT_INSTALLED
 
     if exit_code == 0:
-        if not output.strip():
+        if not output.strip() or only_template_echoes(output):
             return STATUS_EMPTY_OUTPUT
         # A CLI that prints a quota error and still exits 0 would otherwise be recorded as
         # a clean review. Only trust that reading when the output carries no findings at
@@ -228,6 +238,7 @@ def run_capture(command: list[str], cwd: Path, timeout: int | None = None) -> su
         command,
         cwd=str(cwd),
         check=False,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -235,11 +246,21 @@ def run_capture(command: list[str], cwd: Path, timeout: int | None = None) -> su
     )
 
 
-def git_root() -> Path:
+def find_git_root() -> Path | None:
     result = run_capture(["git", "rev-parse", "--show-toplevel"], Path.cwd())
     if result.returncode != 0:
-        raise SystemExit("AI Friend Review requires a git repository.")
+        return None
     return Path(result.stdout.strip()).resolve(strict=False)
+
+
+def git_root() -> Path:
+    root = find_git_root()
+    if root is None:
+        raise SystemExit(
+            "AI Friend Review requires a git repository for diff targets. "
+            "To review a plan, spec, or other document, use --doc <file>, which works outside git."
+        )
+    return root
 
 
 def git_result(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -305,6 +326,8 @@ def reviewer_ranking() -> list[str]:
 
 
 def target_name(args: argparse.Namespace) -> str:
+    if getattr(args, "doc", None) is not None:
+        return f"doc-{safe_slug(Path(args.doc).name)}"
     if args.commit:
         return f"commit-{args.commit[:10]}"
     if args.base:
@@ -400,6 +423,16 @@ def is_probably_binary(data: bytes) -> bool:
     return textish / len(sample) < 0.70
 
 
+def fail_empty_target(reason: str) -> NoReturn:
+    # Reviewers handed an empty target do not say so; they return the format template
+    # unfilled, and the run reads as a clean review. Stop before spending anything.
+    raise SystemExit(
+        f"{reason}, so there is nothing to review. "
+        "To review committed work, use --commit <sha> or --base <branch>. "
+        "To review a plan, spec, or other document in full, use --doc <file>."
+    )
+
+
 def target_summary(args: argparse.Namespace, root: Path) -> tuple[str, str]:
     if args.commit:
         diff_command = f"git show --stat --oneline --decorate {args.commit}"
@@ -409,6 +442,8 @@ def target_summary(args: argparse.Namespace, root: Path) -> tuple[str, str]:
         diff_command = f"git diff --stat {args.base}...HEAD"
         stat = git_output_raw(["diff", "--stat", f"{args.base}...HEAD"], root)
         diff = git_output_raw(["diff", "--no-ext-diff", f"{args.base}...HEAD"], root)
+        if not diff.strip():
+            fail_empty_target(f"--base {args.base}: HEAD has no changes from {args.base}")
         return f"changes from {args.base}...HEAD", bounded_section(diff_command, f"{stat}\n\n{diff}")
     if args.path:
         path = repo_relative_path(args.path, root)
@@ -417,9 +452,16 @@ def target_summary(args: argparse.Namespace, root: Path) -> tuple[str, str]:
         diff = git_output_raw(["diff", "--no-ext-diff", "--", path], root)
         cached = git_output_raw(["diff", "--cached", "--no-ext-diff", "--", path], root)
         untracked = untracked_file_context(root, untracked_files(root, path))
+        if not any(part.strip() for part in (stat, diff, cached, untracked)):
+            fail_empty_target(
+                f"--path {path} has no uncommitted changes "
+                "(--path reviews the uncommitted diff under a path, not the file's contents)"
+            )
         return f"path {path}", bounded_section(diff_command, f"{stat}\n\n{diff}\n\n{cached}\n\n{untracked}")
 
     diff = git_output(["status", "--short"], root)
+    if not diff:
+        fail_empty_target("--uncommitted: the working tree is clean")
     stat = git_output(["diff", "--stat"], root)
     cached_stat = git_output(["diff", "--cached", "--stat"], root)
     unstaged_diff = git_output_raw(["diff", "--no-ext-diff"], root)
@@ -444,7 +486,91 @@ def target_summary(args: argparse.Namespace, root: Path) -> tuple[str, str]:
     return "uncommitted changes", bounded_section("working tree context", body)
 
 
+def load_doc(value: str) -> tuple[Path, str]:
+    """Resolve and read a --doc target, refusing anything a reviewer could not review."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve(strict=False)
+    if not path.exists():
+        raise SystemExit(f"--doc file does not exist: {value}")
+    if not path.is_file():
+        raise SystemExit(f"--doc takes a single file, not a directory: {value}")
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"--doc file could not be read: {value}: {exc}") from exc
+    if is_probably_binary(data):
+        raise SystemExit(f"--doc file looks binary, not a text document: {value}")
+    text = data.decode("utf-8", errors="replace")
+    if not text.strip():
+        raise SystemExit(f"--doc file is empty, so there is nothing to review: {value}")
+    # Truncating would let a reviewer that never saw the end of the document read as
+    # approval of all of it, so refuse instead.
+    size = len(numbered_lines(text))
+    if size > MAX_PROMPT_CONTEXT_CHARS:
+        raise SystemExit(
+            f"--doc file is too large to review in one pass: {size} chars with line numbers, "
+            f"limit {MAX_PROMPT_CONTEXT_CHARS}. Split it into sections and review each one: {value}"
+        )
+    return path, text
+
+
+def numbered_lines(text: str) -> str:
+    return "\n".join(f"{index:>5} | {line}" for index, line in enumerate(text.splitlines(), start=1))
+
+
+def doc_label(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def doc_review_prompt(args: argparse.Namespace, root: Path) -> str:
+    """The prompt for a whole document: a plan or spec has no diff and no changed lines."""
+    label = doc_label(args.doc_path, root)
+    contents = f"Document {label}, with line numbers prefixed:\n{numbered_lines(args.doc_text)}"
+    return f"""You are an independent reviewer. Review the document below. It is a plan, spec, or other written document, not a code diff, so review all of it.
+Document: {label}
+Working directory: {root}
+
+Look for:
+- Wrong or unsupported factual claims, including claims about code, files, or tools you can check from the working directory.
+- Requirement gaps: stated goals the document never delivers, or work it depends on that nobody is assigned.
+- Feasibility and sequencing: steps that cannot work as written, depend on something not yet in place, or come in the wrong order.
+- Risk: security, legal, privacy, or operational exposure the document creates or leaves unaddressed.
+- Internal inconsistency: places where the document contradicts itself.
+
+Do not make edits. You may read files in the working directory to check the document's claims. Do not give style-only comments unless the wording creates a real ambiguity.
+
+Scope: every finding must be about this document and must cite the line or range where the problem appears, using the line numbers prefixed below. Call a claim wrong only when you have evidence; otherwise call it unsupported and say what would confirm it.
+
+Severity rubric:
+- P0: following the document as written would cause data loss, expose secrets, create a serious security or legal problem, or cannot reach its stated goal.
+- P1: a step is likely to fail, a claim the document depends on is wrong, or a stated requirement is not covered.
+- P2: a meaningful gap, sequencing problem, unsupported claim, or missing risk mitigation with realistic impact.
+- P3: a minor inconsistency, ambiguity, or low-risk omission.
+
+Return findings first. Format each finding exactly as:
+
+### Finding: <short title>
+- **Severity**: P0 | P1 | P2 | P3
+- **Location**: {label}:<line or range>
+- **Evidence**: <the document text at that location, plus any file or command you checked>
+- **Confidence**: Low | Medium | High
+- **Why it matters**: <impact>
+- **Suggested fix**: <specific change to the document, or the check that would settle it>
+
+Replace every <placeholder> with real content and never return the template itself. If there are no actionable findings, say that clearly and mention residual risk. Do not invent file paths, line numbers, or command results.
+
+{contents}
+"""
+
+
 def review_prompt(args: argparse.Namespace, root: Path) -> str:
+    if getattr(args, "doc", None) is not None:
+        return doc_review_prompt(args, root)
     target, summary = target_summary(args, root)
     return f"""You are an independent code reviewer. Review {target} in this repository:
 {root}
@@ -469,7 +595,7 @@ Return findings first. Format each finding exactly as:
 - **Why it matters**: <impact>
 - **Suggested fix**: <specific fix or verification step>
 
-If there are no actionable findings, say that clearly and mention residual verification risk. Do not invent file paths, line numbers, tests, or command results.
+Replace every <placeholder> with real content and never return the template itself. If there are no actionable findings, say that clearly and mention residual verification risk. Do not invent file paths, line numbers, tests, or command results.
 
 Target summary:
 {summary}
@@ -517,6 +643,11 @@ def select_reviewers(
     return selected[:desired_count]
 
 
+def last_message_path(prompt_file: Path, reviewer: str) -> Path:
+    """A reviewer's final-answer file: `.ai-friend-review/outputs/`, sharing the prompt's stem."""
+    return prompt_file.parent.parent / "outputs" / f"{prompt_file.stem}-{reviewer}.md"
+
+
 def build_command(agent: dict[str, Any], args: argparse.Namespace, root: Path) -> ReviewCommand | None:
     name = agent["name"]
     executable = agent.get("path") or name
@@ -529,8 +660,21 @@ def build_command(agent: dict[str, Any], args: argparse.Namespace, root: Path) -
         return ReviewCommand(name=name, command=[executable, "--print", prompt_file_instruction, "--sandbox"])
 
     if name == "codex":
-        command = [executable, "exec", "--sandbox", "read-only", prompt_file_instruction]
-        return ReviewCommand(name=name, command=command)
+        # --skip-git-repo-check: the git check guards uncommitted work against agent edits,
+        # which a read-only sandbox already rules out, and --doc reviews may run outside git.
+        # --output-last-message: codex prints its final message twice on stdout.
+        output_file = last_message_path(prompt_file, name)
+        command = [
+            executable,
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(output_file),
+            prompt_file_instruction,
+        ]
+        return ReviewCommand(name=name, command=command, output_file=output_file)
 
     if name == "devin":
         return ReviewCommand(
@@ -606,20 +750,30 @@ def skipped_summary(names: list[str]) -> str:
 
 
 def run_reviewer(review_command: ReviewCommand, root: Path, timeout: int) -> tuple[int, str]:
+    # A reviewer that inherits an open stdin can block until the timeout: codex 0.160
+    # appends piped stdin to its prompt and waits for EOF, and an agent harness may never
+    # close the stdin it hands a tool. Only adapters that send the prompt over stdin get a
+    # pipe; every other reviewer sees EOF immediately.
+    if review_command.stdin is None:
+        stdin_args: dict[str, Any] = {"stdin": subprocess.DEVNULL}
+    else:
+        stdin_args = {"input": review_command.stdin}
+    output_file = review_command.output_file
+    if output_file is not None:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        # A retry must never read the answer an earlier attempt left behind.
+        output_file.unlink(missing_ok=True)
     try:
-        if review_command.stdin is None:
-            result = run_capture(review_command.command, root, timeout)
-        else:
-            result = subprocess.run(
-                review_command.command,
-                cwd=str(root),
-                check=False,
-                input=review_command.stdin,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout,
-            )
+        result = subprocess.run(
+            review_command.command,
+            cwd=str(root),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            **stdin_args,
+        )
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
         if isinstance(output, bytes):
@@ -627,6 +781,11 @@ def run_reviewer(review_command: ReviewCommand, root: Path, timeout: int) -> tup
         return 124, f"Reviewer timed out after {timeout}s.\n{output}".strip()
     except OSError as exc:
         return 127, f"Reviewer launch failed: {exc}"
+    # On failure stdout carries the diagnostic, so only a clean exit reads the answer file.
+    if result.returncode == 0 and output_file is not None and output_file.is_file():
+        last_message = output_file.read_text(errors="replace").strip()
+        if last_message:
+            return result.returncode, last_message
     return result.returncode, result.stdout.strip()
 
 
@@ -689,6 +848,7 @@ def preflight(commands: list[ReviewCommand], root: Path) -> dict[str, str]:
                 [executable, "--version"],
                 cwd=str(root),
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -748,7 +908,8 @@ def markdown_fence(text: str) -> str:
 def command_display(command: list[str]) -> str:
     visible = []
     for part in command:
-        if "\n" in part or len(part) > 160:
+        # Mask prompt text, which is long prose; keep long file paths, which carry no spaces.
+        if "\n" in part or (len(part) > 160 and " " in part):
             visible.append(f"<review-prompt:{len(part)} chars>")
         else:
             visible.append(part)
@@ -810,7 +971,24 @@ def finding_from_block(reviewer: str, title: str, block_lines: list[str]) -> Fin
     )
 
 
+def is_template_echo(finding: Finding) -> bool:
+    fields = (finding.title, finding.location, finding.evidence, finding.why, finding.fix)
+    placeholders = sum(1 for value in fields if TEMPLATE_PLACEHOLDER_RE.match(value.strip().strip("`")))
+    return placeholders >= TEMPLATE_ECHO_MIN_FIELDS
+
+
+def only_template_echoes(output: str) -> bool:
+    """True when the output's finding blocks are all the unfilled format template."""
+    blocks = parse_finding_blocks("", output)
+    return bool(blocks) and all(is_template_echo(finding) for finding in blocks)
+
+
 def parse_findings(reviewer: str, output: str) -> list[Finding]:
+    """Real findings only. A template echo is not a finding and must never surface as one."""
+    return [finding for finding in parse_finding_blocks(reviewer, output) if not is_template_echo(finding)]
+
+
+def parse_finding_blocks(reviewer: str, output: str) -> list[Finding]:
     findings: list[Finding] = []
     current_title: str | None = None
     current_lines: list[str] = []
@@ -1024,7 +1202,8 @@ def resolve_shas(args: argparse.Namespace, root: Path) -> tuple[str | None, str 
     """Best-effort (head_sha, base_sha) for the reviewed target.
 
     Returns None for either value rather than guessing when the target has no meaningful
-    base (an uncommitted or path review), so a consumer keying on SHA can tell the
+    base (an uncommitted or path review) or is a document whose contents no commit
+    describes (a doc review), so a consumer keying on SHA can tell the
     difference between "not applicable" and "wrong". Every lookup is soft: a repo with no
     commits, or a root commit with no parent, must degrade to None rather than abort a
     review that has already been paid for.
@@ -1034,6 +1213,9 @@ def resolve_shas(args: argparse.Namespace, root: Path) -> tuple[str | None, str 
         result = run_capture(["git", *git_args], root)
         return result.stdout.strip() or None if result.returncode == 0 else None
 
+    if getattr(args, "doc", None) is not None:
+        # The repo's HEAD says nothing about a document's contents.
+        return None, None
     head = soft("rev-parse", "HEAD")
     if args.commit:
         return soft("rev-parse", args.commit), soft("rev-parse", f"{args.commit}^")
@@ -1131,7 +1313,8 @@ def main() -> int:
     target.add_argument("--uncommitted", action="store_true", help="Review staged, unstaged, and untracked work.")
     target.add_argument("--base", help="Review changes against a base branch.")
     target.add_argument("--commit", help="Review one commit.")
-    target.add_argument("--path", help="Review a specific file or directory.")
+    target.add_argument("--path", help="Review uncommitted changes under a specific file or directory.")
+    target.add_argument("--doc", help="Review the full text of a plan, spec, or other document. Works outside git.")
     parser.add_argument("--current-agent", help="Name of the agent running this skill.")
     parser.add_argument("--include-current-agent", action="store_true", help="Allow the current agent as a reviewer.")
     parser.add_argument("--include-self", action="store_true", help="Alias for --include-current-agent.")
@@ -1151,7 +1334,14 @@ def main() -> int:
             f"Shorter timeouts report as reviewer failures rather than saving time."
         )
 
-    root = git_root()
+    if args.doc is not None:
+        args.doc_path, args.doc_text = load_doc(args.doc)
+        # A document needs no diff. Run from the current repo when there is one, so
+        # reviewers can check the document's claims against the code; otherwise from the
+        # document's own folder, which also holds this run's prompt and report.
+        root = find_git_root() or args.doc_path.parent
+    else:
+        root = git_root()
     agents = discover_agents(args.refresh)
     requested = args.reviewer[:]
     if args.reviewers:
@@ -1191,7 +1381,10 @@ def main() -> int:
 
     print("AI Friend Review will run read-only reviewer commands.", flush=True)
     print("These commands may consume paid or quota-limited AI usage.", flush=True)
-    print("Review context may include diffs and untracked file contents. Inspect your changes for secrets before running external reviewers.", flush=True)
+    if args.doc is not None:
+        print(f"Review context is the full text of {args.doc_path}. Check it for secrets before running external reviewers.", flush=True)
+    else:
+        print("Review context may include diffs and untracked file contents. Inspect your changes for secrets before running external reviewers.", flush=True)
     print(f"Full review prompt file: {prompt_file}", flush=True)
     for item in commands:
         stdin_note = " (review prompt sent over stdin)" if item.stdin is not None else ""
